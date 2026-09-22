@@ -1,15 +1,20 @@
-// index.js
+// index.js (Render Worker)
 const express = require("express");
 const cors = require("cors");
-const { exec } = require("child_process");
 const path = require("path");
 const fs = require("fs");
+const { exec } = require("child_process");
+const { promisify } = require("util");
+const ffmpegPath = require("ffmpeg-static");
+const youtubeDl = require("yt-dlp-exec");
 
+const execAsync = promisify(exec);
 const app = express();
+
 app.use(cors());
 app.use(express.json());
 
-app.post("/api/process", (req, res) => {
+app.post("/api/process", async (req, res) => {
   const { videoUrl, startTime, endTime } = req.body;
 
   if (!videoUrl || !startTime || !endTime) {
@@ -19,21 +24,36 @@ app.post("/api/process", (req, res) => {
   const outputFileName = `trim_${Date.now()}.mp4`;
   const outputPath = path.join("/tmp", outputFileName);
 
-  // Uses yt-dlp to grab stream URLs and passes them straight to FFmpeg
-  const command = `ffmpeg -ss ${startTime} -to ${endTime} -i "$(yt-dlp -g -f 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best' "${videoUrl}" | head -n 1)" -c:v libx264 -preset ultrafast -c:a aac "${outputPath}"`;
+  try {
+    // 1. Fetch direct media stream URL via yt-dlp-exec
+    const streamOutput = await youtubeDl(videoUrl, {
+      getUrl: true,
+      format: "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+    });
 
-  exec(command, (error, stdout, stderr) => {
-    if (error) {
-      console.error("FFmpeg Error:", stderr);
-      return res.status(500).json({ error: "Failed to process video" });
+    const mediaUrl = String(streamOutput).trim().split("\n")[0];
+
+    if (!mediaUrl) {
+      throw new Error("Could not extract media stream URL from yt-dlp.");
     }
 
-    res.download(outputPath, () => {
+    // 2. Trim video using ffmpeg-static
+    const ffmpegCmd = `"${ffmpegPath}" -ss ${startTime} -to ${endTime} -i "${mediaUrl}" -c:v libx264 -preset ultrafast -c:a aac "${outputPath}"`;
+    await execAsync(ffmpegCmd);
+
+    // 3. Download output file and cleanup /tmp
+    res.download(outputPath, (err) => {
       if (fs.existsSync(outputPath)) {
-        fs.unlinkSync(outputPath); // Clean up temp file
+        fs.unlinkSync(outputPath);
       }
     });
-  });
+  } catch (error) {
+    console.error("[RENDER WORKER ERROR]:", error.message);
+    return res.status(500).json({
+      error: "Failed to process video",
+      details: error.message,
+    });
+  }
 });
 
 const PORT = process.env.PORT || 4000;
